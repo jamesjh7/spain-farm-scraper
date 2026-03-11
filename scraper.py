@@ -715,7 +715,7 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
                 municipality = parts[0]
                 break
 
-        region = self._guess_region(self, province + " " + municipality)
+        region = self._guess_region(province + " " + municipality)
         images = []
         for img in soup.select("img[src], img[data-src]"):
             src = img.get("src") or img.get("data-src") or ""
@@ -740,17 +740,17 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
             "bedrooms": bedrooms,
             "bathrooms": bathrooms,
             "year_built": None,
-            "property_type": self._guess_type(self, title + " " + description),
-            "nearest_airport": self._guess_airport(self, region, province),
+            "property_type": self._guess_type(title + " " + description),
+            "nearest_airport": self._guess_airport(region, province),
             "nearest_city": None,
-            "water_source": self._guess_water(self, description),
+            "water_source": self._guess_water(description),
             "pool": "pool" in description.lower() or "piscina" in description.lower(),
-            "outbuildings": self._guess_outbuildings(self, description),
-            "agricultural_features": self._guess_ag_features(self, description),
-            "event_venue_potential": self._venue_notes(self, description),
-            "airbnb_potential": self._airbnb_notes(self, description),
-            "condition": self._guess_condition(self, description),
-            "energy_rating": self._guess_energy(self, soup),
+            "outbuildings": self._guess_outbuildings(description),
+            "agricultural_features": self._guess_ag_features(description),
+            "event_venue_potential": self._venue_notes(description),
+            "airbnb_potential": self._airbnb_notes(description),
+            "condition": self._guess_condition(description),
+            "energy_rating": self._guess_energy(soup),
             "listing_date": datetime.now().strftime("%Y-%m-%d"),
             "description_raw": description[:3000],
             "notes": "",
@@ -864,7 +864,7 @@ class GreenAcresPlaywrightScraper(PlaywrightScraper):
                 municipality = loc_text.split("(")[0].strip()
                 prov_m = re.search(r'\(([^)]+)\)', loc_text)
                 province = prov_m.group(1) if prov_m else ""
-                region = self._guess_region(self, province + " " + municipality)
+                region = self._guess_region(province + " " + municipality)
 
                 bedrooms = build_m2 = land_m2 = None
                 for tag in card.select(".info-tag.shown"):
@@ -900,16 +900,16 @@ class GreenAcresPlaywrightScraper(PlaywrightScraper):
                     "bedrooms": bedrooms,
                     "bathrooms": None,
                     "year_built": None,
-                    "property_type": self._guess_type(self, title),
-                    "nearest_airport": self._guess_airport(self, region, province),
+                    "property_type": self._guess_type(title),
+                    "nearest_airport": self._guess_airport(region, province),
                     "nearest_city": None,
-                    "water_source": self._guess_water(self, description),
+                    "water_source": self._guess_water(description),
                     "pool": False,
                     "outbuildings": "",
-                    "agricultural_features": self._guess_ag_features(self, description),
-                    "event_venue_potential": self._venue_notes(self, description),
-                    "airbnb_potential": self._airbnb_notes(self, description),
-                    "condition": self._guess_condition(self, description),
+                    "agricultural_features": self._guess_ag_features(description),
+                    "event_venue_potential": self._venue_notes(description),
+                    "airbnb_potential": self._airbnb_notes(description),
+                    "condition": self._guess_condition(description),
                     "energy_rating": "unknown",
                     "listing_date": datetime.now().strftime("%Y-%m-%d"),
                     "description_raw": description[:1000],
@@ -1049,7 +1049,7 @@ class IdealistaScraper(PlaywrightScraper):
             elif len(texts) >= 2:
                 municipality = texts[-1]
 
-        region_guess = self._guess_region(self, province + " " + municipality + " " + region)
+        region_guess = self._guess_region(province + " " + municipality + " " + region)
         if region_guess == "Unknown":
             region_guess = region
 
@@ -1078,17 +1078,17 @@ class IdealistaScraper(PlaywrightScraper):
             "bedrooms": bedrooms,
             "bathrooms": bathrooms,
             "year_built": None,
-            "property_type": self._guess_type(self, title + " " + description),
-            "nearest_airport": self._guess_airport(self, region_guess, province),
+            "property_type": self._guess_type(title + " " + description),
+            "nearest_airport": self._guess_airport(region_guess, province),
             "nearest_city": None,
-            "water_source": self._guess_water(self, description),
+            "water_source": self._guess_water(description),
             "pool": "pool" in description.lower() or "piscina" in description.lower(),
-            "outbuildings": self._guess_outbuildings(self, description),
-            "agricultural_features": self._guess_ag_features(self, description),
-            "event_venue_potential": self._venue_notes(self, description),
-            "airbnb_potential": self._airbnb_notes(self, description),
-            "condition": self._guess_condition(self, description),
-            "energy_rating": self._guess_energy(self, soup),
+            "outbuildings": self._guess_outbuildings(description),
+            "agricultural_features": self._guess_ag_features(description),
+            "event_venue_potential": self._venue_notes(description),
+            "airbnb_potential": self._airbnb_notes(description),
+            "condition": self._guess_condition(description),
+            "energy_rating": self._guess_energy(soup),
             "listing_date": datetime.now().strftime("%Y-%m-%d"),
             "description_raw": description[:3000],
             "notes": "",
@@ -1204,7 +1204,7 @@ class FotocasaScraper(PlaywrightScraper):
         desc_el = soup.select_one("[class*='description'], [class*='Description']")
         description = desc_el.get_text("\n", strip=True) if desc_el else ""
 
-        region_guess = self._guess_region(self, region)
+        region_guess = self._guess_region(region)
         images = [img.get("src") or img.get("data-src") for img in soup.select("img") if img.get("src") or img.get("data-src")]
         images = [i for i in images if i and ("fotocasa" in i or "photo" in i)][:10]
 
@@ -1224,17 +1224,17 @@ class FotocasaScraper(PlaywrightScraper):
             "bedrooms": bedrooms,
             "bathrooms": bathrooms,
             "year_built": None,
-            "property_type": self._guess_type(self, title + " " + description),
-            "nearest_airport": self._guess_airport(self, region_guess, ""),
+            "property_type": self._guess_type(title + " " + description),
+            "nearest_airport": self._guess_airport(region_guess, ""),
             "nearest_city": None,
-            "water_source": self._guess_water(self, description),
+            "water_source": self._guess_water(description),
             "pool": "pool" in description.lower() or "piscina" in description.lower(),
-            "outbuildings": self._guess_outbuildings(self, description),
-            "agricultural_features": self._guess_ag_features(self, description),
-            "event_venue_potential": self._venue_notes(self, description),
-            "airbnb_potential": self._airbnb_notes(self, description),
-            "condition": self._guess_condition(self, description),
-            "energy_rating": self._guess_energy(self, soup),
+            "outbuildings": self._guess_outbuildings(description),
+            "agricultural_features": self._guess_ag_features(description),
+            "event_venue_potential": self._venue_notes(description),
+            "airbnb_potential": self._airbnb_notes(description),
+            "condition": self._guess_condition(description),
+            "energy_rating": self._guess_energy(soup),
             "listing_date": datetime.now().strftime("%Y-%m-%d"),
             "description_raw": description[:3000],
             "notes": "",
