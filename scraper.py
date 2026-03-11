@@ -567,10 +567,22 @@ class PlaywrightScraper:
     def __init__(self, source: str):
         self.source = source
 
-    async def _get_page_html(self, page: Page, url: str) -> Optional[BeautifulSoup]:
+    async def _get_page_html(self, page: Page, url: str, wait: str = "networkidle") -> Optional[BeautifulSoup]:
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(random.randint(2000, 4000))
+            await page.goto(url, wait_until=wait, timeout=45000)
+            await page.wait_for_timeout(random.randint(2500, 5000))
+            # Try to dismiss cookie banners
+            for sel in ["#acceptAllButton", "#onetrust-accept-btn-handler",
+                        "button[id*='accept']", "button:has-text('Accept all')",
+                        "button:has-text('Aceptar')", "button:has-text('Accept')"]:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=800):
+                        await btn.click()
+                        await page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    pass
             html = await page.content()
             return BeautifulSoup(html, "html.parser")
         except Exception as e:
@@ -591,14 +603,19 @@ class PlaywrightScraper:
 
 
 # ---------------------------------------------------------------------------
-# Kyero Playwright scraper (blocks static requests)
+# Kyero Playwright scraper
+# Confirmed: listing links are /en/property/XXXXXXX-slug on /en/spain page
 # ---------------------------------------------------------------------------
 
 class KyeroPlaywrightScraper(PlaywrightScraper):
     BASE = "https://www.kyero.com"
     SEARCH_URLS = [
-        "/en/properties/spain?property_type%5B%5D=country-house&property_type%5B%5D=farmhouse&min_price=50000&max_price=2000000",
-        "/en/properties/spain?property_type%5B%5D=finca&min_price=50000&max_price=2000000",
+        "/en/spain?type%5B%5D=country-house&type%5B%5D=farmhouse&location=andalucia&min_price=50000&max_price=2000000",
+        "/en/spain?type%5B%5D=country-house&type%5B%5D=farmhouse&location=valenciana&min_price=50000&max_price=2000000",
+        "/en/spain?type%5B%5D=country-house&type%5B%5D=farmhouse&location=murcia&min_price=50000&max_price=2000000",
+        "/en/spain?type%5B%5D=country-house&type%5B%5D=farmhouse&location=cataluna&min_price=50000&max_price=2000000",
+        "/en/spain?type%5B%5D=country-house&type%5B%5D=farmhouse&location=castilla&min_price=50000&max_price=2000000",
+        "/en/spain?type%5B%5D=country-house&type%5B%5D=farmhouse&location=extremadura&min_price=50000&max_price=2000000",
     ]
 
     def __init__(self):
@@ -624,6 +641,7 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
                 if not listing_urls:
                     log.info("[Kyero] No listings found — stopping.")
                     break
+                log.info(f"[Kyero] Found {len(listing_urls)} listings on page {pg}")
                 for lurl in listing_urls:
                     await page.wait_for_timeout(random.randint(2500, 5000))
                     detail = await self._parse_detail(page, lurl)
@@ -637,9 +655,9 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
 
     def _parse_list(self, soup: BeautifulSoup) -> list[str]:
         urls = []
-        for a in soup.select("a[href*='/en/property/']"):
-            href = a.get("href", "")
-            if href:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/en/property/" in href or "/property/" in href:
                 full = href if href.startswith("http") else self.BASE + href
                 if full not in urls:
                     urls.append(full)
@@ -650,11 +668,11 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
         if not soup:
             return None
 
-        title = soup.select_one("h1")
-        title = title.get_text(strip=True) if title else ""
+        title_el = soup.select_one("h1")
+        title = title_el.get_text(strip=True) if title_el else ""
 
         price_eur = None
-        for sel in ["[class*='price']", ".property-price", "strong"]:
+        for sel in ["[data-testid='price']", "[class*='price']", ".property-price"]:
             el = soup.select_one(sel)
             if el:
                 n = safe_int(el.get_text())
@@ -663,39 +681,47 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
                     break
 
         bedrooms = bathrooms = land_m2 = build_m2 = None
-        for li in soup.select("li, [class*='spec'], [class*='feature']"):
+        for li in soup.select("li, [class*='spec'], [class*='feature'], [class*='stat'], dt, dd"):
             txt = li.get_text(" ", strip=True).lower()
-            if re.search(r"\d+\s*(bed|dormitor|habitaci)", txt):
+            if re.search(r"\d+\s*(bed|dormitor|habitaci)", txt) and bedrooms is None:
                 m = re.search(r"(\d+)", txt)
                 if m:
                     bedrooms = int(m.group(1))
-            elif re.search(r"\d+\s*(bath|baño)", txt):
+            elif re.search(r"\d+\s*(bath|baño)", txt) and bathrooms is None:
                 m = re.search(r"(\d+)", txt)
                 if m:
                     bathrooms = int(m.group(1))
             elif re.search(r"[\d,\.]+\s*m[²2]", txt):
                 num = extract_number(txt)
                 if num:
-                    if any(k in txt for k in ["plot", "land", "parcela", "terreno"]):
-                        land_m2 = int(num)
-                    elif any(k in txt for k in ["built", "construid", "floor"]):
-                        build_m2 = int(num)
+                    if any(k in txt for k in ["plot", "land", "parcela", "terreno", "plot size"]):
+                        if land_m2 is None:
+                            land_m2 = int(num)
+                    elif any(k in txt for k in ["built", "construid", "floor", "living"]):
+                        if build_m2 is None:
+                            build_m2 = int(num)
 
-        desc_el = soup.select_one("[class*='description'], [itemprop='description']")
+        desc_el = soup.select_one("[class*='description'], [itemprop='description'], [class*='content']")
         description = desc_el.get_text("\n", strip=True) if desc_el else ""
 
-        loc_parts = []
-        for sel in ["[class*='location']", "address", ".breadcrumb"]:
-            el = soup.select_one(sel)
-            if el:
-                loc_parts = [p.strip() for p in el.get_text(",", strip=True).split(",")]
+        municipality = province = ""
+        for sel in [".breadcrumbs a", "nav[aria-label*='read'] a", "[class*='location']", "address"]:
+            parts = [el.get_text(strip=True) for el in soup.select(sel)]
+            parts = [p for p in parts if p and p not in ("Home", "Spain", "Properties")]
+            if len(parts) >= 2:
+                municipality, province = parts[-1], parts[-2]
                 break
-        municipality = loc_parts[0] if loc_parts else ""
-        province = loc_parts[1] if len(loc_parts) > 1 else ""
-        region = self._guess_region(self, province + " " + municipality)
+            elif len(parts) == 1:
+                municipality = parts[0]
+                break
 
-        images = [img.get("src") or img.get("data-src") for img in soup.select("img") if img.get("src") or img.get("data-src")]
-        images = [i for i in images if i][:10]
+        region = self._guess_region(self, province + " " + municipality)
+        images = []
+        for img in soup.select("img[src], img[data-src]"):
+            src = img.get("src") or img.get("data-src") or ""
+            if src and src not in images and not src.endswith(".svg"):
+                images.append(src)
+        images = images[:10]
         land_ha = round(land_m2 / 10000, 2) if land_m2 else None
 
         prop = {
@@ -737,31 +763,166 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
 
 # ---------------------------------------------------------------------------
 # Green Acres Playwright scraper
+# URLs are base64-encoded in data-o attr of .announce-card; extract card data
+# directly without visiting individual listing pages.
 # ---------------------------------------------------------------------------
 
-class GreenAcresPlaywrightScraper(KyeroPlaywrightScraper):
+class GreenAcresPlaywrightScraper(PlaywrightScraper):
     BASE = "https://www.green-acres.es"
     SEARCH_URLS = [
-        "/property-for-sale/andalusia?price_min=50000&price_max=2000000",
-        "/property-for-sale/valencian-community?price_min=50000&price_max=2000000",
-        "/property-for-sale/murcia?price_min=50000&price_max=2000000",
-        "/property-for-sale/catalonia?price_min=50000&price_max=2000000",
-        "/property-for-sale/castilla-la-mancha?price_min=50000&price_max=2000000",
-        "/property-for-sale/extremadura?price_min=50000&price_max=2000000",
+        "/country-house/andalusia",
+        "/country-house/valencia",
+        "/country-house/murcia",
+        "/country-house/catalonia",
+        "/finca/andalusia",
+        "/finca/valencia",
+        "/finca/murcia",
+        "/country-house/extremadura",
     ]
 
     def __init__(self):
-        PlaywrightScraper.__init__(self, "green-acres.es")
+        super().__init__("green-acres.es")
 
-    def _parse_list(self, soup: BeautifulSoup) -> list[str]:
-        urls = []
-        for a in soup.select("a[href*='/property/'], a[href*='/advert/'], .property-card a, .listing a"):
-            href = a.get("href", "")
-            if href:
-                full = href if href.startswith("http") else self.BASE + href
-                if full not in urls and full != self.BASE + "/":
-                    urls.append(full)
-        return urls
+    async def scrape(self, browser: Browser, max_pages=5) -> list[dict]:
+        results = []
+        context = await browser.new_context(user_agent=random_ua(), locale="en-GB", viewport={"width": 1366, "height": 900})
+        page = await context.new_page()
+
+        for path in self.SEARCH_URLS:
+            url = self.BASE + path
+            for pg in range(1, max_pages + 1):
+                paged_url = url if pg == 1 else url + f"?page={pg}"
+                log.info(f"[GreenAcres] {path} / page {pg}")
+
+                try:
+                    await page.goto(paged_url, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(2000)
+
+                    # Accept cookie consent (tarteaucitron)
+                    for sel in ["#tarteaucitronAllAllowed",
+                                "button:has-text('OK, accept everything')",
+                                "button:has-text('Accept all')",
+                                "button:has-text('OK')"]:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=1500):
+                                await btn.click()
+                                await page.wait_for_timeout(1500)
+                                break
+                        except Exception:
+                            pass
+
+                    # Scroll to trigger AJAX listing load
+                    for y in [800, 1600, 2400, 3200]:
+                        await page.evaluate(f"window.scrollTo(0, {y})")
+                        await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(3000)
+
+                    html = await page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+
+                except Exception as e:
+                    log.error(f"[GreenAcres] Error loading {paged_url}: {e}")
+                    break
+
+                cards = self._parse_cards(soup)
+                if not cards:
+                    log.info(f"[GreenAcres] No cards on page {pg} — stopping.")
+                    break
+                log.info(f"[GreenAcres] Found {len(cards)} cards on page {pg}")
+                results.extend(cards)
+                await page.wait_for_timeout(random.randint(3000, 6000))
+
+        await context.close()
+        log.info(f"[GreenAcres] Total collected: {len(results)}")
+        return results
+
+    def _parse_cards(self, soup: BeautifulSoup) -> list[dict]:
+        """Extract listing data directly from announce-card elements."""
+        import base64
+        results = []
+
+        for card in soup.select(".announce-card"):
+            try:
+                data_o = card.get("data-o", "")
+                if not data_o:
+                    continue
+                # Pad base64 and decode URL
+                padded = data_o + "=" * (4 - len(data_o) % 4)
+                url = base64.b64decode(padded).decode("utf-8", errors="replace")
+                if not url.startswith("http"):
+                    url = self.BASE + url
+
+                title = card.get("title", "")
+                price_eur = None
+                price_el = card.select_one(".info-price-container")
+                if price_el:
+                    price_eur = safe_int(price_el.get_text())
+
+                loc_el = card.select_one(".announce-localisation")
+                loc_text = loc_el.get_text(strip=True) if loc_el else ""
+                municipality = loc_text.split("(")[0].strip()
+                prov_m = re.search(r'\(([^)]+)\)', loc_text)
+                province = prov_m.group(1) if prov_m else ""
+                region = self._guess_region(self, province + " " + municipality)
+
+                bedrooms = build_m2 = land_m2 = None
+                for tag in card.select(".info-tag.shown"):
+                    txt = tag.get_text(strip=True).lower()
+                    if "bedroom" in txt:
+                        m = re.search(r"(\d+)", txt)
+                        if m:
+                            bedrooms = int(m.group(1))
+                    elif "m²" in txt or "m2" in txt:
+                        num = extract_number(txt)
+                        if num:
+                            if "land" in txt or "plot" in txt:
+                                land_m2 = int(num)
+                            else:
+                                build_m2 = int(num)
+
+                land_ha = round(land_m2 / 10000, 2) if land_m2 else None
+                description = card.get_text(" ", strip=True)
+
+                prop = {
+                    "listing_id": make_id(url),
+                    "title": title,
+                    "url": url,
+                    "source_site": self.source,
+                    "region": region,
+                    "province": province,
+                    "municipality": municipality,
+                    "price_eur": price_eur,
+                    "price_per_sqm_eur": round(price_eur / build_m2) if price_eur and build_m2 else None,
+                    "land_area_hectares": land_ha,
+                    "land_area_m2": land_m2,
+                    "build_area_m2": build_m2,
+                    "bedrooms": bedrooms,
+                    "bathrooms": None,
+                    "year_built": None,
+                    "property_type": self._guess_type(self, title),
+                    "nearest_airport": self._guess_airport(self, region, province),
+                    "nearest_city": None,
+                    "water_source": self._guess_water(self, description),
+                    "pool": False,
+                    "outbuildings": "",
+                    "agricultural_features": self._guess_ag_features(self, description),
+                    "event_venue_potential": self._venue_notes(self, description),
+                    "airbnb_potential": self._airbnb_notes(self, description),
+                    "condition": self._guess_condition(self, description),
+                    "energy_rating": "unknown",
+                    "listing_date": datetime.now().strftime("%Y-%m-%d"),
+                    "description_raw": description[:1000],
+                    "notes": "Card-level data; visit URL for full details",
+                    "images": [],
+                    "login_required": False,
+                }
+                prop["total_score"] = score_property(prop)
+                results.append(prop)
+            except Exception as e:
+                log.warning(f"[GreenAcres] Error parsing card: {e}")
+
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +1129,8 @@ class FotocasaScraper(PlaywrightScraper):
 
         for region_slug, region_label in self.REGIONS:
             for pg in range(1, max_pages + 1):
-                url = f"{self.BASE}/en/homes-for-sale/{region_slug}/all-zones/all-municipalities/all-counties/l"
+                # Fotocasa URL format: /en/buy/homes/[region]/all-zones/l
+                url = f"{self.BASE}/en/buy/homes/{region_slug}/all-zones/l"
                 if pg > 1:
                     url += f"?page={pg}"
 
@@ -983,6 +1145,7 @@ class FotocasaScraper(PlaywrightScraper):
 
                 listing_urls = self._parse_list(soup)
                 if not listing_urls:
+                    log.info(f"[Fotocasa] No listings on page {pg} — stopping.")
                     break
 
                 for lurl in listing_urls:
@@ -999,11 +1162,13 @@ class FotocasaScraper(PlaywrightScraper):
 
     def _parse_list(self, soup: BeautifulSoup) -> list[str]:
         urls = []
-        for a in soup.select("a[href*='/en/homes-for-sale/'], a[href*='/inmueble/']"):
-            href = a.get("href", "")
-            if href and "/homes-for-sale/" in href:
-                full = href if href.startswith("http") else self.BASE + href
-                if full not in urls and full != f"{self.BASE}/en/homes-for-sale/":
+        import re
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            full = href if href.startswith("http") else self.BASE + href
+            # Fotocasa property detail URLs: /en/buy/homes/[region]/[municipality]/[id]/
+            if re.search(r'/en/buy/homes/[a-z-]+/[a-z-]+/\d+', full):
+                if full not in urls:
                     urls.append(full)
         return urls
 
@@ -1176,10 +1341,7 @@ async def main():
         add_results(await green.scrape(browser, max_pages=5))
         save_json(all_properties, JSON_FILE)
 
-        log.info("\n>>> Scraping Idealista...")
-        idealista = IdealistaScraper()
-        add_results(await idealista.scrape(browser, max_pages=4))
-        save_json(all_properties, JSON_FILE)
+        log.info("\n>>> Skipping Idealista (anti-bot protection blocks headless browsers)")
 
         log.info("\n>>> Scraping Fotocasa...")
         fotocasa = FotocasaScraper()
