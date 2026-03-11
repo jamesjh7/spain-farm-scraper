@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+spain_properties.json
+spain_properties.csv
+spain_properties_summary.md
+scrape_log.txt
