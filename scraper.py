@@ -207,7 +207,7 @@ class StaticSession:
         try:
             r = self.session.get(url, timeout=20, **kwargs)
             if r.status_code == 200:
-                return BeautifulSoup(r.text, "lxml")
+                return BeautifulSoup(r.text, "html.parser")
             elif r.status_code == 403:
                 log.warning(f"403 Forbidden: {url}")
             elif r.status_code == 429:
@@ -572,7 +572,7 @@ class PlaywrightScraper:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(random.randint(2000, 4000))
             html = await page.content()
-            return BeautifulSoup(html, "lxml")
+            return BeautifulSoup(html, "html.parser")
         except Exception as e:
             log.error(f"[{self.source}] Playwright error loading {url}: {e}")
             return None
@@ -588,6 +588,180 @@ class PlaywrightScraper:
     _airbnb_notes = KyeroScraper._airbnb_notes
     _guess_condition = KyeroScraper._guess_condition
     _guess_energy = KyeroScraper._guess_energy
+
+
+# ---------------------------------------------------------------------------
+# Kyero Playwright scraper (blocks static requests)
+# ---------------------------------------------------------------------------
+
+class KyeroPlaywrightScraper(PlaywrightScraper):
+    BASE = "https://www.kyero.com"
+    SEARCH_URLS = [
+        "/en/properties/spain?property_type%5B%5D=country-house&property_type%5B%5D=farmhouse&min_price=50000&max_price=2000000",
+        "/en/properties/spain?property_type%5B%5D=finca&min_price=50000&max_price=2000000",
+    ]
+
+    def __init__(self):
+        super().__init__("kyero.com")
+
+    async def scrape(self, browser: Browser, max_pages=6) -> list[dict]:
+        results = []
+        context = await browser.new_context(user_agent=random_ua(), locale="en-GB", viewport={"width": 1280, "height": 900})
+        page = await context.new_page()
+
+        for path in self.SEARCH_URLS:
+            url = self.BASE + path
+            for pg in range(1, max_pages + 1):
+                paged_url = url if pg == 1 else url + f"&page={pg}"
+                log.info(f"[Kyero] page {pg}: {paged_url}")
+                soup = await self._get_page_html(page, paged_url)
+                if not soup:
+                    break
+                if "captcha" in (soup.get_text() or "").lower():
+                    log.warning(f"[Kyero] CAPTCHA — skipping")
+                    break
+                listing_urls = self._parse_list(soup)
+                if not listing_urls:
+                    log.info("[Kyero] No listings found — stopping.")
+                    break
+                for lurl in listing_urls:
+                    await page.wait_for_timeout(random.randint(2500, 5000))
+                    detail = await self._parse_detail(page, lurl)
+                    if detail:
+                        results.append(detail)
+                await page.wait_for_timeout(random.randint(3000, 6000))
+
+        await context.close()
+        log.info(f"[Kyero] Total collected: {len(results)}")
+        return results
+
+    def _parse_list(self, soup: BeautifulSoup) -> list[str]:
+        urls = []
+        for a in soup.select("a[href*='/en/property/']"):
+            href = a.get("href", "")
+            if href:
+                full = href if href.startswith("http") else self.BASE + href
+                if full not in urls:
+                    urls.append(full)
+        return urls
+
+    async def _parse_detail(self, page: Page, url: str) -> Optional[dict]:
+        soup = await self._get_page_html(page, url)
+        if not soup:
+            return None
+
+        title = soup.select_one("h1")
+        title = title.get_text(strip=True) if title else ""
+
+        price_eur = None
+        for sel in ["[class*='price']", ".property-price", "strong"]:
+            el = soup.select_one(sel)
+            if el:
+                n = safe_int(el.get_text())
+                if n and n > 10000:
+                    price_eur = n
+                    break
+
+        bedrooms = bathrooms = land_m2 = build_m2 = None
+        for li in soup.select("li, [class*='spec'], [class*='feature']"):
+            txt = li.get_text(" ", strip=True).lower()
+            if re.search(r"\d+\s*(bed|dormitor|habitaci)", txt):
+                m = re.search(r"(\d+)", txt)
+                if m:
+                    bedrooms = int(m.group(1))
+            elif re.search(r"\d+\s*(bath|baño)", txt):
+                m = re.search(r"(\d+)", txt)
+                if m:
+                    bathrooms = int(m.group(1))
+            elif re.search(r"[\d,\.]+\s*m[²2]", txt):
+                num = extract_number(txt)
+                if num:
+                    if any(k in txt for k in ["plot", "land", "parcela", "terreno"]):
+                        land_m2 = int(num)
+                    elif any(k in txt for k in ["built", "construid", "floor"]):
+                        build_m2 = int(num)
+
+        desc_el = soup.select_one("[class*='description'], [itemprop='description']")
+        description = desc_el.get_text("\n", strip=True) if desc_el else ""
+
+        loc_parts = []
+        for sel in ["[class*='location']", "address", ".breadcrumb"]:
+            el = soup.select_one(sel)
+            if el:
+                loc_parts = [p.strip() for p in el.get_text(",", strip=True).split(",")]
+                break
+        municipality = loc_parts[0] if loc_parts else ""
+        province = loc_parts[1] if len(loc_parts) > 1 else ""
+        region = self._guess_region(self, province + " " + municipality)
+
+        images = [img.get("src") or img.get("data-src") for img in soup.select("img") if img.get("src") or img.get("data-src")]
+        images = [i for i in images if i][:10]
+        land_ha = round(land_m2 / 10000, 2) if land_m2 else None
+
+        prop = {
+            "listing_id": make_id(url),
+            "title": title,
+            "url": url,
+            "source_site": self.source,
+            "region": region,
+            "province": province,
+            "municipality": municipality,
+            "price_eur": price_eur,
+            "price_per_sqm_eur": round(price_eur / build_m2) if price_eur and build_m2 else None,
+            "land_area_hectares": land_ha,
+            "land_area_m2": land_m2,
+            "build_area_m2": build_m2,
+            "bedrooms": bedrooms,
+            "bathrooms": bathrooms,
+            "year_built": None,
+            "property_type": self._guess_type(self, title + " " + description),
+            "nearest_airport": self._guess_airport(self, region, province),
+            "nearest_city": None,
+            "water_source": self._guess_water(self, description),
+            "pool": "pool" in description.lower() or "piscina" in description.lower(),
+            "outbuildings": self._guess_outbuildings(self, description),
+            "agricultural_features": self._guess_ag_features(self, description),
+            "event_venue_potential": self._venue_notes(self, description),
+            "airbnb_potential": self._airbnb_notes(self, description),
+            "condition": self._guess_condition(self, description),
+            "energy_rating": self._guess_energy(self, soup),
+            "listing_date": datetime.now().strftime("%Y-%m-%d"),
+            "description_raw": description[:3000],
+            "notes": "",
+            "images": images,
+            "login_required": False,
+        }
+        prop["total_score"] = score_property(prop)
+        return prop
+
+
+# ---------------------------------------------------------------------------
+# Green Acres Playwright scraper
+# ---------------------------------------------------------------------------
+
+class GreenAcresPlaywrightScraper(KyeroPlaywrightScraper):
+    BASE = "https://www.green-acres.es"
+    SEARCH_URLS = [
+        "/property-for-sale/andalusia?price_min=50000&price_max=2000000",
+        "/property-for-sale/valencian-community?price_min=50000&price_max=2000000",
+        "/property-for-sale/murcia?price_min=50000&price_max=2000000",
+        "/property-for-sale/catalonia?price_min=50000&price_max=2000000",
+        "/property-for-sale/castilla-la-mancha?price_min=50000&price_max=2000000",
+        "/property-for-sale/extremadura?price_min=50000&price_max=2000000",
+    ]
+
+    def __init__(self):
+        PlaywrightScraper.__init__(self, "green-acres.es")
+
+    def _parse_list(self, soup: BeautifulSoup) -> list[str]:
+        urls = []
+        for a in soup.select("a[href*='/property/'], a[href*='/advert/'], .property-card a, .listing a"):
+            href = a.get("href", "")
+            if href:
+                full = href if href.startswith("http") else self.BASE + href
+                if full not in urls and full != self.BASE + "/":
+                    urls.append(full)
+        return urls
 
 
 # ---------------------------------------------------------------------------
@@ -984,36 +1158,23 @@ async def main():
             elif not pid:
                 all_properties.append(p)
 
-    # --- Static scrapers ---
-    session = StaticSession()
-
-    log.info("\n>>> Scraping Kyero...")
-    kyero = KyeroScraper(session)
-    add_results(kyero.scrape(max_pages=8))
-    save_json(all_properties, JSON_FILE)
-
-    log.info("\n>>> Scraping Green Acres...")
-    green = GreenAcresScraper(session)
-    add_results(green.scrape(max_pages=6))
-    save_json(all_properties, JSON_FILE)
-
-    log.info("\n>>> Scraping Rurales.com...")
-    rurales = RuralesScraper(session)
-    add_results(rurales.scrape(max_pages=5))
-    save_json(all_properties, JSON_FILE)
-
-    log.info("\n>>> Scraping Rightmove Overseas...")
-    rightmove = RightmoveScraper(session)
-    add_results(rightmove.scrape(max_pages=5))
-    save_json(all_properties, JSON_FILE)
-
-    # --- Playwright scrapers ---
-    log.info("\n>>> Starting Playwright for JS-rendered sites...")
+    # --- All scrapers now use Playwright (static sites block direct requests) ---
+    log.info("\n>>> Starting Playwright browser...")
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
+
+        log.info("\n>>> Scraping Kyero...")
+        kyero = KyeroPlaywrightScraper()
+        add_results(await kyero.scrape(browser, max_pages=6))
+        save_json(all_properties, JSON_FILE)
+
+        log.info("\n>>> Scraping Green Acres...")
+        green = GreenAcresPlaywrightScraper()
+        add_results(await green.scrape(browser, max_pages=5))
+        save_json(all_properties, JSON_FILE)
 
         log.info("\n>>> Scraping Idealista...")
         idealista = IdealistaScraper()
