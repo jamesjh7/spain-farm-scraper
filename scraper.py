@@ -623,6 +623,7 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
 
     async def scrape(self, browser: Browser, max_pages=6) -> list[dict]:
         results = []
+        seen_urls: set[str] = set()
         context = await browser.new_context(user_agent=random_ua(), locale="en-GB", viewport={"width": 1280, "height": 900})
         page = await context.new_page()
 
@@ -637,10 +638,11 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
                 if "captcha" in (soup.get_text() or "").lower():
                     log.warning(f"[Kyero] CAPTCHA — skipping")
                     break
-                listing_urls = self._parse_list(soup)
+                listing_urls = [u for u in self._parse_list(soup) if u not in seen_urls]
                 if not listing_urls:
-                    log.info("[Kyero] No listings found — stopping.")
+                    log.info("[Kyero] No new listings found — stopping.")
                     break
+                seen_urls.update(listing_urls)
                 log.info(f"[Kyero] Found {len(listing_urls)} listings on page {pg}")
                 for lurl in listing_urls:
                     await page.wait_for_timeout(random.randint(2500, 5000))
@@ -671,49 +673,56 @@ class KyeroPlaywrightScraper(PlaywrightScraper):
         title_el = soup.select_one("h1")
         title = title_el.get_text(strip=True) if title_el else ""
 
+        # Use full page text for robust regex-based extraction (Kyero uses Tailwind, no semantic class names)
+        full_text = soup.get_text(" ", strip=True)
+
+        # Price: first "€ 795,000" style match
         price_eur = None
-        for sel in ["[data-testid='price']", "[class*='price']", ".property-price"]:
-            el = soup.select_one(sel)
-            if el:
-                n = safe_int(el.get_text())
-                if n and n > 10000:
-                    price_eur = n
-                    break
+        pm = re.search(r'€\s*([\d][0-9,\.]*)', full_text)
+        if pm:
+            n = safe_int(pm.group(1))
+            if n and n > 10000:
+                price_eur = n
 
+        # Specs appear as "5Bedrooms", "466m²Build size", "5747m²Plot size"
         bedrooms = bathrooms = land_m2 = build_m2 = None
-        for li in soup.select("li, [class*='spec'], [class*='feature'], [class*='stat'], dt, dd"):
-            txt = li.get_text(" ", strip=True).lower()
-            if re.search(r"\d+\s*(bed|dormitor|habitaci)", txt) and bedrooms is None:
-                m = re.search(r"(\d+)", txt)
-                if m:
-                    bedrooms = int(m.group(1))
-            elif re.search(r"\d+\s*(bath|baño)", txt) and bathrooms is None:
-                m = re.search(r"(\d+)", txt)
-                if m:
-                    bathrooms = int(m.group(1))
-            elif re.search(r"[\d,\.]+\s*m[²2]", txt):
-                num = extract_number(txt)
-                if num:
-                    if any(k in txt for k in ["plot", "land", "parcela", "terreno", "plot size"]):
-                        if land_m2 is None:
-                            land_m2 = int(num)
-                    elif any(k in txt for k in ["built", "construid", "floor", "living"]):
-                        if build_m2 is None:
-                            build_m2 = int(num)
+        bm = re.search(r'(\d+)\s*Bedrooms', full_text)
+        if bm:
+            bedrooms = int(bm.group(1))
+        batm = re.search(r'(\d+)\s*Bathrooms', full_text)
+        if batm:
+            bathrooms = int(batm.group(1))
+        plotm = re.search(r'([\d,]+)\s*m[²2]\s*Plot\s*size', full_text)
+        if plotm:
+            land_m2 = safe_int(plotm.group(1))
+        buildm = re.search(r'([\d,]+)\s*m[²2]\s*Build\s*size', full_text)
+        if buildm:
+            build_m2 = safe_int(buildm.group(1))
 
-        desc_el = soup.select_one("[class*='description'], [itemprop='description'], [class*='content']")
-        description = desc_el.get_text("\n", strip=True) if desc_el else ""
+        # Description: use full page text for feature detection (pool, water, outbuildings etc.)
+        description = full_text
 
+        # Location: look for "Town, Area, Province, Region, Spain" pattern in a <p> tag
         municipality = province = ""
-        for sel in [".breadcrumbs a", "nav[aria-label*='read'] a", "[class*='location']", "address"]:
-            parts = [el.get_text(strip=True) for el in soup.select(sel)]
-            parts = [p for p in parts if p and p not in ("Home", "Spain", "Properties")]
-            if len(parts) >= 2:
-                municipality, province = parts[-1], parts[-2]
-                break
-            elif len(parts) == 1:
-                municipality = parts[0]
-                break
+        for p_el in soup.find_all("p"):
+            loc = p_el.get_text(strip=True)
+            if ", Spain" in loc and len(loc) < 200:
+                parts = [x.strip() for x in loc.replace(", Spain", "").split(",")]
+                if len(parts) >= 2:
+                    municipality = parts[0]
+                    province = parts[-1]
+                    break
+        # Fallback to breadcrumb-style links
+        if not municipality:
+            for sel in [".breadcrumbs a", "nav[aria-label*='read'] a", "address"]:
+                parts = [el.get_text(strip=True) for el in soup.select(sel)]
+                parts = [p for p in parts if p and p not in ("Home", "Spain", "Properties")]
+                if len(parts) >= 2:
+                    municipality, province = parts[0], parts[-2]
+                    break
+                elif len(parts) == 1:
+                    municipality = parts[0]
+                    break
 
         region = self._guess_region(province + " " + municipality)
         images = []
@@ -774,9 +783,7 @@ class GreenAcresPlaywrightScraper(PlaywrightScraper):
         "/country-house/valencia",
         "/country-house/murcia",
         "/country-house/catalonia",
-        "/finca/andalusia",
-        "/finca/valencia",
-        "/finca/murcia",
+        "/country-house/castile-la-mancha",
         "/country-house/extremadura",
     ]
 
@@ -867,18 +874,18 @@ class GreenAcresPlaywrightScraper(PlaywrightScraper):
                 region = self._guess_region(province + " " + municipality)
 
                 bedrooms = build_m2 = land_m2 = None
-                for tag in card.select(".info-tag.shown"):
+                for tag in card.select(".info-tag"):
                     txt = tag.get_text(strip=True).lower()
-                    if "bedroom" in txt:
+                    if "bedroom" in txt or "room" in txt:
                         m = re.search(r"(\d+)", txt)
-                        if m:
+                        if m and bedrooms is None:
                             bedrooms = int(m.group(1))
                     elif "m²" in txt or "m2" in txt:
                         num = extract_number(txt)
                         if num:
-                            if "land" in txt or "plot" in txt:
+                            if "land" in txt or "plot" in txt or "terrain" in txt:
                                 land_m2 = int(num)
-                            else:
+                            elif build_m2 is None:
                                 build_m2 = int(num)
 
                 land_ha = round(land_m2 / 10000, 2) if land_m2 else None
@@ -1100,146 +1107,198 @@ class IdealistaScraper(PlaywrightScraper):
 
 
 # ---------------------------------------------------------------------------
-# Fotocasa scraper (Playwright)
+# Fotocasa scraper — direct API (no Playwright needed)
+# Uses the public search API to get rural properties (propertySubtypeIds=9).
+# Location IDs discovered from: web.gw.fotocasa.es/v2/propertysearch/urllocationsegments
 # ---------------------------------------------------------------------------
 
 class FotocasaScraper(PlaywrightScraper):
+    """Fotocasa rural-property scraper using their public JSON API."""
     BASE = "https://www.fotocasa.es"
+    API_URL = "https://web.gw.fotocasa.es/v2/propertysearch/search"
 
+    # (url_slug, region_label, combinedLocationIds)
     REGIONS = [
-        ("andalucia", "Andalusia"),
-        ("comunitat-valenciana", "Valencia"),
-        ("region-de-murcia", "Murcia"),
-        ("cataluna", "Catalonia"),
-        ("castilla-la-mancha", "Castilla-La Mancha"),
-        ("extremadura", "Extremadura"),
+        ("andalucia",            "Andalusia",          "724,1,0,0,0,0,0,0,0"),
+        ("comunitat-valenciana", "Valencia",           "724,19,0,0,0,0,0,0,0"),
+        ("region-de-murcia",     "Murcia",             "724,16,0,0,0,0,0,0,0"),
+        ("cataluna",             "Catalonia",          "724,9,0,0,0,0,0,0,0"),
+        ("castilla-la-mancha",   "Castilla-La Mancha", "724,8,0,0,0,0,0,0,0"),
+        ("extremadura",          "Extremadura",        "724,11,0,0,0,0,0,0,0"),
     ]
 
     def __init__(self):
         super().__init__("fotocasa.es")
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": random_ua(),
+            "Accept": "application/json",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Referer": "https://www.fotocasa.es/en/buy/rural-properties/andalucia/all-zones/l",
+            "Origin": "https://www.fotocasa.es",
+        })
 
-    async def scrape(self, browser: Browser, max_pages=5) -> list[dict]:
+    async def scrape(self, browser: Browser, max_pages: int = 5) -> list[dict]:
+        """Scrape using API (browser is not used)."""
         results = []
-        context = await browser.new_context(
-            user_agent=random_ua(),
-            locale="en-GB",
-            viewport={"width": 1366, "height": 768},
-        )
-        page = await context.new_page()
+        seen_ids: set = set()
 
-        for region_slug, region_label in self.REGIONS:
+        for slug, region_label, loc_ids in self.REGIONS:
             for pg in range(1, max_pages + 1):
-                # Fotocasa URL format: /en/buy/homes/[region]/all-zones/l
-                url = f"{self.BASE}/en/buy/homes/{region_slug}/all-zones/l"
-                if pg > 1:
-                    url += f"?page={pg}"
-
                 log.info(f"[Fotocasa] {region_label} / page {pg}")
-                soup = await self._get_page_html(page, url)
-                if not soup:
+                try:
+                    r = self._session.get(self.API_URL, params={
+                        "combinedLocationIds": loc_ids,
+                        "propertyTypeId":    "2",   # residential/casa
+                        "propertySubtypeIds": "9",  # rural property subtype
+                        "transactionTypeId": "1",   # buy
+                        "culture":     "en-GB",
+                        "pageNumber":  str(pg),
+                        "maxItems":    "30",
+                        "siteId":      "1",
+                        "sortType":    "scoring",
+                    }, timeout=20)
+                except Exception as e:
+                    log.error(f"[Fotocasa] Request error {region_label} page {pg}: {e}")
                     break
 
-                if "captcha" in (soup.get_text() or "").lower():
-                    log.warning(f"[Fotocasa] CAPTCHA on {url}")
+                if r.status_code != 200:
+                    log.warning(f"[Fotocasa] HTTP {r.status_code} — {region_label} page {pg}")
                     break
 
-                listing_urls = self._parse_list(soup)
-                if not listing_urls:
-                    log.info(f"[Fotocasa] No listings on page {pg} — stopping.")
+                try:
+                    data = r.json()
+                except Exception:
+                    log.error(f"[Fotocasa] Bad JSON — {region_label} page {pg}")
                     break
 
-                for lurl in listing_urls:
-                    await page.wait_for_timeout(random.randint(2000, 4500))
-                    detail = await self._parse_detail(page, lurl, region_label)
-                    if detail:
-                        results.append(detail)
+                estates = data.get("realEstates", [])
+                if not estates:
+                    log.info(f"[Fotocasa] No results on page {pg} — stopping")
+                    break
 
-                await page.wait_for_timeout(random.randint(3000, 6000))
+                for e in estates:
+                    prop_id = e.get("id")
+                    if prop_id in seen_ids:
+                        continue
+                    seen_ids.add(prop_id)
+                    prop = self._parse_estate(e, region_label)
+                    if prop:
+                        results.append(prop)
 
-        await context.close()
+                rand_delay(1.0, 2.5)
+
         log.info(f"[Fotocasa] Total collected: {len(results)}")
         return results
 
-    def _parse_list(self, soup: BeautifulSoup) -> list[str]:
-        urls = []
-        import re
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            full = href if href.startswith("http") else self.BASE + href
-            # Fotocasa property detail URLs: /en/buy/homes/[region]/[municipality]/[id]/
-            if re.search(r'/en/buy/homes/[a-z-]+/[a-z-]+/\d+', full):
-                if full not in urls:
-                    urls.append(full)
-        return urls
+    def _parse_estate(self, e: dict, region_label: str) -> Optional[dict]:
+        prop_id = e.get("id", 0)
+        detail_path = (e.get("detail") or {}).get("en", "")
+        url = self.BASE + detail_path if detail_path else ""
 
-    async def _parse_detail(self, page: Page, url: str, region: str) -> Optional[dict]:
-        soup = await self._get_page_html(page, url)
-        if not soup:
-            return None
-
-        title = ""
-        h1 = soup.select_one("h1")
-        if h1:
-            title = h1.get_text(strip=True)
-
+        # Price
         price_eur = None
-        for sel in ["[class*='price'] span", ".re-DetailHeader-price", "[data-testid='detail-price']"]:
-            el = soup.select_one(sel)
-            if el:
-                price_eur = safe_int(el.get_text())
-                break
+        txns = e.get("transactions") or []
+        if txns and txns[0].get("value"):
+            v = txns[0]["value"][0]
+            if isinstance(v, (int, float)) and 10000 < v < 50_000_000:
+                price_eur = int(v)
 
-        bedrooms = bathrooms = land_m2 = build_m2 = None
-        for el in soup.select("[class*='feature'], [class*='detail'], li"):
-            txt = el.get_text(" ", strip=True).lower()
-            if re.search(r"\d+.*(bed|dormitor|habitaci)", txt):
-                m = re.search(r"(\d+)", txt)
-                if m:
-                    bedrooms = int(m.group(1))
-            elif re.search(r"\d+.*(bath|baño)", txt):
-                m = re.search(r"(\d+)", txt)
-                if m:
-                    bathrooms = int(m.group(1))
+        # Location
+        addr   = e.get("address") or {}
+        loc    = addr.get("location") or {}
+        municipality = (addr.get("ubication") or "").strip().lstrip()
+        province     = (loc.get("level2") or "").strip()
+        region = self._guess_region(province + " " + municipality + " " + region_label)
+        if region == "Unknown":
+            region = region_label
 
-        desc_el = soup.select_one("[class*='description'], [class*='Description']")
-        description = desc_el.get_text("\n", strip=True) if desc_el else ""
+        # Features dict
+        feats = {}
+        for f in (e.get("features") or []):
+            v = f.get("value")
+            feats[f["key"]] = v[0] if v else None
+        bedrooms  = feats.get("rooms")
+        bathrooms = feats.get("bathrooms")
+        raw_surface = feats.get("surface")
+        has_pool  = bool(feats.get("swimming_pool"))
+        cond_code = feats.get("conservationState")
+        condition = {1: "new", 2: "excellent", 3: "good", 4: "needs renovation", 5: "ruins"}.get(cond_code, "unknown")
 
-        region_guess = self._guess_region(region)
-        images = [img.get("src") or img.get("data-src") for img in soup.select("img") if img.get("src") or img.get("data-src")]
-        images = [i for i in images if i and ("fotocasa" in i or "photo" in i)][:10]
+        # Description (Spanish — used for agricultural feature detection)
+        description = e.get("description") or ""
+        if isinstance(description, dict):
+            description = description.get("es") or description.get("en") or ""
+
+        # Extract land area from description text.
+        # Fotocasa's 'surface' API field is build area for normal homes, but for some
+        # rural listings it returns total area. We trust description-extracted land area
+        # over the API surface field (which we cap at 5000 m² for build area).
+        land_m2 = None
+
+        # Hectares: "5 ha", "5ha", "5 hectáreas", "5 hectares"
+        hm = re.search(r'([\d][0-9,.]*)\s*h(?:a\b|ect[aá]re?as?)', description, re.IGNORECASE)
+        if hm:
+            try:
+                land_m2 = int(float(hm.group(1).replace(".", "").replace(",", ".")) * 10000)
+            except Exception:
+                pass
+
+        if not land_m2:
+            # "10.000 m² de finca/parcela/terreno/tierra"
+            pm = re.search(
+                r'([\d][0-9.]*)\s*m[²2]\s*(?:de\s*)?(finca|parcela|terreno|tierra)',
+                description, re.IGNORECASE)
+            if pm:
+                land_m2 = safe_int(pm.group(1))
+
+        if not land_m2:
+            # Large standalone m² values (≥5000 m² = 0.5 ha) in rural context
+            pm2 = re.search(r'(\d[\d.]*[05]\d{3})\s*m[²2]', description)
+            if pm2:
+                n = safe_int(pm2.group(1))
+                if n and n >= 5000:
+                    land_m2 = n
+
+        land_ha = round(land_m2 / 10000, 2) if land_m2 else None
+
+        # build_m2: use API surface only if plausible (≤5000 m²); otherwise null
+        build_m2 = raw_surface if (raw_surface and raw_surface <= 5000) else None
+
+        images = [m["url"] for m in (e.get("multimedias") or []) if m.get("url")][:10]
 
         prop = {
-            "listing_id": make_id(url),
-            "title": title,
-            "url": url,
-            "source_site": self.source,
-            "region": region_guess,
-            "province": "",
-            "municipality": "",
-            "price_eur": price_eur,
-            "price_per_sqm_eur": None,
-            "land_area_hectares": None,
-            "land_area_m2": land_m2,
-            "build_area_m2": build_m2,
-            "bedrooms": bedrooms,
-            "bathrooms": bathrooms,
-            "year_built": None,
-            "property_type": self._guess_type(title + " " + description),
-            "nearest_airport": self._guess_airport(region_guess, ""),
-            "nearest_city": None,
-            "water_source": self._guess_water(description),
-            "pool": "pool" in description.lower() or "piscina" in description.lower(),
-            "outbuildings": self._guess_outbuildings(description),
+            "listing_id":          str(prop_id),
+            "title":               municipality or "Rural property",
+            "url":                 url,
+            "source_site":         self.source,
+            "region":              region,
+            "province":            province,
+            "municipality":        municipality,
+            "price_eur":           price_eur,
+            "price_per_sqm_eur":   round(price_eur / build_m2) if price_eur and build_m2 else None,
+            "land_area_hectares":  land_ha,
+            "land_area_m2":        land_m2,
+            "build_area_m2":       build_m2,
+            "bedrooms":            bedrooms,
+            "bathrooms":           bathrooms,
+            "year_built":          None,
+            "property_type":       "Rural Property",
+            "nearest_airport":     self._guess_airport(region, province),
+            "nearest_city":        None,
+            "water_source":        self._guess_water(description),
+            "pool":                has_pool,
+            "outbuildings":        self._guess_outbuildings(description),
             "agricultural_features": self._guess_ag_features(description),
             "event_venue_potential": self._venue_notes(description),
-            "airbnb_potential": self._airbnb_notes(description),
-            "condition": self._guess_condition(description),
-            "energy_rating": self._guess_energy(soup),
-            "listing_date": datetime.now().strftime("%Y-%m-%d"),
-            "description_raw": description[:3000],
-            "notes": "",
-            "images": images,
-            "login_required": False,
+            "airbnb_potential":    self._airbnb_notes(description),
+            "condition":           condition,
+            "energy_rating":       "unknown",
+            "listing_date":        datetime.now().strftime("%Y-%m-%d"),
+            "description_raw":     description[:3000],
+            "notes":               "API search data; rural property subtype",
+            "images":              images,
+            "login_required":      False,
         }
         prop["total_score"] = score_property(prop)
         return prop
@@ -1257,47 +1316,175 @@ def save_json(properties: list[dict], path: Path):
 def save_csv(properties: list[dict], path: Path):
     if not properties:
         return
-    flat = []
+    rows = []
     for p in properties:
-        row = dict(p)
-        row["agricultural_features"] = ", ".join(row.get("agricultural_features") or [])
-        row["images"] = " | ".join(row.get("images") or [])
-        flat.append(row)
-    df = pd.DataFrame(flat)
+        price = p.get("price_eur")
+        land_ha = p.get("land_area_hectares")
+        land_m2 = p.get("land_area_m2")
+        build_m2 = p.get("build_area_m2")
+        price_per_ha = round(price / land_ha) if price and land_ha else None
+        price_per_m2_land = round(price / land_m2) if price and land_m2 else None
+        price_per_m2_build = round(price / build_m2) if price and build_m2 else None
+        rows.append({
+            "score":               p.get("total_score", ""),
+            "title":               p.get("title", ""),
+            "url":                 p.get("url", ""),
+            "source":              p.get("source_site", ""),
+            "region":              p.get("region", ""),
+            "province":            p.get("province", ""),
+            "municipality":        p.get("municipality", ""),
+            "price_eur":           price or "",
+            "bedrooms":            p.get("bedrooms", ""),
+            "bathrooms":           p.get("bathrooms", ""),
+            "land_ha":             land_ha or "",
+            "land_m2":             land_m2 or "",
+            "build_m2":            build_m2 or "",
+            "price_per_ha":        price_per_ha or "",
+            "price_per_m2_land":   price_per_m2_land or "",
+            "price_per_m2_build":  price_per_m2_build or "",
+            "property_type":       p.get("property_type", ""),
+            "pool":                "yes" if p.get("pool") else "no",
+            "water_source":        p.get("water_source", ""),
+            "condition":           p.get("condition", ""),
+            "outbuildings":        p.get("outbuildings", ""),
+            "agricultural_features": ", ".join(p.get("agricultural_features") or []),
+            "nearest_airport":     p.get("nearest_airport", ""),
+            "listing_date":        p.get("listing_date", ""),
+        })
+    df = pd.DataFrame(rows)
     df.to_csv(path, index=False, encoding="utf-8-sig")
-    log.info(f"Saved CSV to {path}")
+    log.info(f"Saved CSV ({len(rows)} rows) to {path}")
+
+
+def _region_stats(properties: list[dict]) -> list[dict]:
+    """Compute per-region averages for the summary."""
+    from collections import defaultdict
+    buckets: dict[str, list] = defaultdict(list)
+    for p in properties:
+        buckets[p.get("region") or "Unknown"].append(p)
+
+    stats = []
+    for region, props in sorted(buckets.items()):
+        prices   = [p["price_eur"] for p in props if p.get("price_eur")]
+        lands_ha = [p["land_area_hectares"] for p in props if p.get("land_area_hectares")]
+        builds   = [p["build_area_m2"] for p in props if p.get("build_area_m2")]
+        beds_all = [p["bedrooms"] for p in props if p.get("bedrooms")]
+        # Only include €/ha for genuine farm-sized plots (≥1 ha = 10,000 m²)
+        pph_list = [p["price_eur"] / p["land_area_hectares"]
+                    for p in props
+                    if p.get("price_eur") and p.get("land_area_hectares")
+                    and p["land_area_hectares"] >= 1.0]
+        def avg(lst): return round(sum(lst) / len(lst)) if lst else None
+        stats.append({
+            "region":       region,
+            "count":        len(props),
+            "avg_price":    avg(prices),
+            "min_price":    min(prices) if prices else None,
+            "max_price":    max(prices) if prices else None,
+            "avg_land_ha":  round(sum(lands_ha)/len(lands_ha), 1) if lands_ha else None,
+            "avg_build_m2": avg(builds),
+            "avg_beds":     round(sum(beds_all)/len(beds_all), 1) if beds_all else None,
+            "avg_price_per_ha": avg(pph_list),
+            "priced_count": len(prices),
+            "with_land_count": len(lands_ha),
+        })
+    return stats
+
 
 def save_summary(properties: list[dict], path: Path, top_n=20):
     sorted_props = sorted(properties, key=lambda x: x.get("total_score", 0), reverse=True)
     top = sorted_props[:top_n]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    priced    = [p for p in properties if p.get("price_eur")]
+    landed    = [p for p in properties if p.get("land_area_hectares")]
+    # Farm-sized: ≥1 ha — exclude tiny garden plots from €/ha stats
+    farm_sized = [p for p in properties if (p.get("land_area_hectares") or 0) >= 1.0]
+    pph_list  = [p["price_eur"] / p["land_area_hectares"]
+                 for p in farm_sized if p.get("price_eur")]
+
+    def avg(lst): return round(sum(lst) / len(lst)) if lst else None
+    def fmt_eur(n): return f"€{n:,}" if n else "—"
+    def fmt_ha(n):  return f"{n} ha" if n else "—"
+
+    # ── TLDR block ──────────────────────────────────────────────────────────
     lines = [
-        "# Spain Rural Properties — Top Candidates",
-        f"\n_Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_",
-        f"\nTotal listings collected: **{len(properties)}**\n",
-        "---\n",
+        "# Spain Rural Properties — TLDR Summary",
+        f"\n_Generated: {now}_\n",
+        "## At a Glance",
+        f"- **{len(properties)}** total listings scraped across "
+        f"{len(set(p.get('source_site','') for p in properties))} sites",
+        f"- **{len(priced)}** have a listed price, "
+        f"**{len(landed)}** have land area data",
+        f"- Overall avg price: **{fmt_eur(avg([p['price_eur'] for p in priced]))}**",
+        f"- Overall avg land (all with data): **{fmt_ha(round(sum(p['land_area_hectares'] for p in landed)/len(landed),1) if landed else None)}**",
+        f"- Avg price/hectare (plots ≥1 ha only, n={len(pph_list)}): **{fmt_eur(avg(pph_list))}**",
+        "",
     ]
 
-    for i, p in enumerate(top, 1):
-        price_str = f"€{p['price_eur']:,}" if p.get("price_eur") else "Price unknown"
-        land_str = f"{p['land_area_hectares']} ha" if p.get("land_area_hectares") else "Land area unknown"
-        beds_str = f"{p['bedrooms']} bed" if p.get("bedrooms") else "?"
-        region = p.get("region", "Unknown")
-        score = p.get("total_score", 0)
-        ag = ", ".join(p.get("agricultural_features") or []) or "None noted"
+    # ── Region breakdown table ────────────────────────────────────────────
+    lines.append("## By Region\n")
+    lines.append("| Region | Listings | Avg Price | Price Range | Avg Land | Avg €/ha | Avg Beds |")
+    lines.append("|--------|----------|-----------|-------------|----------|----------|----------|")
+    for s in _region_stats(properties):
+        price_range = (f"{fmt_eur(s['min_price'])}–{fmt_eur(s['max_price'])}"
+                       if s["min_price"] else "—")
+        lines.append(
+            f"| {s['region']} | {s['count']} ({s['priced_count']} priced) "
+            f"| {fmt_eur(s['avg_price'])} | {price_range} "
+            f"| {fmt_ha(s['avg_land_ha'])} | {fmt_eur(s['avg_price_per_ha'])} "
+            f"| {s['avg_beds'] or '—'} |"
+        )
 
-        lines.append(f"## {i}. {p.get('title', 'Untitled')} — Score: {score}/10")
-        lines.append(f"\n**Source:** [{p.get('source_site')}]({p.get('url')})")
-        lines.append(f"**Location:** {p.get('municipality', '')}, {p.get('province', '')}, {region}")
-        lines.append(f"**Price:** {price_str} | **Land:** {land_str} | **Beds:** {beds_str}")
-        lines.append(f"**Type:** {p.get('property_type', 'unknown').title()}")
-        lines.append(f"**Airport:** {p.get('nearest_airport', 'unknown')}")
-        lines.append(f"**Agricultural features:** {ag}")
-        lines.append(f"**Pool:** {'Yes' if p.get('pool') else 'No'} | **Condition:** {p.get('condition', 'unknown')}")
-        lines.append(f"\n**Why it fits:**")
-        lines.append(f"- Farming: {p.get('event_venue_potential', 'N/A')}")
-        lines.append(f"- Airbnb: {p.get('airbnb_potential', 'N/A')}")
-        lines.append(f"\n---\n")
+    # ── Price per hectare distribution ────────────────────────────────────
+    if pph_list:
+        pph_sorted = sorted(pph_list)
+        n = len(pph_sorted)
+        lines += [
+            "",
+            "## Price per Hectare Distribution",
+            f"- Cheapest: **{fmt_eur(round(pph_sorted[0]))}**/ha",
+            f"- Median:   **{fmt_eur(round(pph_sorted[n//2]))}**/ha",
+            f"- Top 25%:  **{fmt_eur(round(pph_sorted[int(n*0.75)]))}**/ha",
+            f"- Most expensive: **{fmt_eur(round(pph_sorted[-1]))}**/ha",
+        ]
+
+    # ── Source breakdown ──────────────────────────────────────────────────
+    from collections import Counter
+    sources = Counter(p.get("source_site","?") for p in properties)
+    lines += ["", "## By Source"]
+    for src, cnt in sources.most_common():
+        lines.append(f"- **{src}**: {cnt} listings")
+
+    # ── Top listings ──────────────────────────────────────────────────────
+    lines += ["", "---", "", f"## Top {len(top)} Properties by Score", ""]
+
+    for i, p in enumerate(top, 1):
+        price_str = fmt_eur(p.get("price_eur"))
+        land_ha   = p.get("land_area_hectares")
+        land_str  = f"{land_ha} ha" if land_ha else "land unknown"
+        build_str = f"{p['build_area_m2']} m²" if p.get("build_area_m2") else ""
+        pph       = round(p["price_eur"] / land_ha) if p.get("price_eur") and land_ha else None
+        pph_str   = f" · {fmt_eur(pph)}/ha" if pph else ""
+        beds_str  = str(p["bedrooms"]) if p.get("bedrooms") else "?"
+        region    = p.get("region", "Unknown")
+        score     = p.get("total_score", 0)
+        ag        = ", ".join(p.get("agricultural_features") or []) or "none noted"
+        # Only show €/ha for plots ≥1 ha
+        pph_str   = f" · {fmt_eur(pph)}/ha" if pph and land_ha and land_ha >= 1.0 else ""
+        loc_parts = [x for x in [p.get("municipality"), p.get("province"), region] if x and x != "Unknown"]
+        loc_str   = ", ".join(loc_parts) if loc_parts else region
+
+        lines.append(f"### {i}. {p.get('title', 'Untitled')} — Score: {score}/10")
+        lines.append(f"**{price_str}** · {land_str}{pph_str} · {build_str} · {beds_str} beds")
+        lines.append(loc_str)
+        lines.append(f"[{p.get('source_site','')}]({p.get('url','')})")
+        lines.append(f"Type: {p.get('property_type','?').title()} · "
+                     f"Pool: {'yes' if p.get('pool') else 'no'} · "
+                     f"Water: {p.get('water_source') or '?'} · "
+                     f"Airport: {p.get('nearest_airport') or '?'}")
+        lines.append(f"Ag features: {ag}")
+        lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
     log.info(f"Summary saved to {path}")
